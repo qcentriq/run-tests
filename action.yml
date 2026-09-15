@@ -1,0 +1,305 @@
+# =============================================================================
+# QCentriQ Test Run — GitHub Action
+#
+# Triggers a QCentriQ test suite, waits for the verdict, and fails the step when
+# tests fail so branch protection can gate the merge.
+#
+# Self-contained: talks to the QCentriQ API with curl + jq (both preinstalled on
+# GitHub-hosted runners). Nothing is downloaded at run time and no CLI is
+# required. `actions/checkout` is NOT needed — QCentriQ never reads the
+# repository; test definitions live in QCentriQ and execute on its own runners.
+#
+# Exit codes: 0 passed · 1 test failure · 2 run error · 3 action/transport error
+# =============================================================================
+name: 'QCentriQ Test Run'
+description: 'Trigger a QCentriQ test suite, report results, and gate the pull request'
+author: 'QCentriQ'
+branding:
+  icon: 'check-circle'
+  color: 'purple'
+
+inputs:
+  api-url:
+    description: 'Base URL of your QCentriQ instance, e.g. https://qcentriq.example.com'
+    required: true
+  api-token:
+    description: 'QCentriQ project-scoped API key. Always pass via secrets.'
+    required: true
+  project-id:
+    description: 'UUID of the QCentriQ project'
+    required: true
+  test-group-id:
+    description: 'UUID of the test group to run. Mutually exclusive with test-case-id.'
+    required: false
+    default: ''
+  test-case-id:
+    description: 'UUID of a single test case to run. Mutually exclusive with test-group-id.'
+    required: false
+    default: ''
+  environment-id:
+    description: 'UUID of the QCentriQ environment to run against. Defaults to the project setting.'
+    required: false
+    default: ''
+  browser-id:
+    description: 'UUID of the browser to run on. Defaults to the project setting.'
+    required: false
+    default: ''
+  env-vars:
+    description: |
+      KEY=VALUE pairs, one per line, overriding the QCentriQ-configured
+      environment values. CI wins on collision. The value may itself contain
+      "=" (base64, JWTs) — only the first "=" separates key from value.
+      Server limits: at most 50 keys and 4096 bytes serialized.
+    required: false
+    default: ''
+  poll-interval:
+    description: 'Seconds between status polls. The API allows 60 requests/minute.'
+    required: false
+    default: '5'
+  timeout:
+    description: 'Maximum seconds to wait for the run to reach a terminal status'
+    required: false
+    default: '3600'
+  fail-on-test-failure:
+    description: 'Fail the step when tests fail. Set to false to report without gating.'
+    required: false
+    default: 'true'
+  upload-log:
+    description: 'Upload run.log as a workflow artifact'
+    required: false
+    default: 'true'
+  comment-on-pr:
+    description: 'Post a sticky summary comment on the pull request'
+    required: false
+    default: 'true'
+
+outputs:
+  run-id:
+    description: 'UUID of the QCentriQ run'
+    value: ${{ steps.run.outputs.run-id }}
+  status:
+    description: 'Terminal run status: passed, failed or error'
+    value: ${{ steps.run.outputs.status }}
+  total:
+    description: 'Total number of test cases executed'
+    value: ${{ steps.run.outputs.total }}
+  passed:
+    description: 'Number of test cases that passed'
+    value: ${{ steps.run.outputs.passed }}
+  failed:
+    description: 'Number of test cases that failed'
+    value: ${{ steps.run.outputs.failed }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        # Secrets travel by environment, never argv: argv is world-readable
+        # through `ps` on a shared runner.
+        QC_TOKEN: ${{ inputs.api-token }}
+        QC_URL: ${{ inputs.api-url }}
+        PROJECT_ID: ${{ inputs.project-id }}
+        GROUP_ID: ${{ inputs.test-group-id }}
+        CASE_ID: ${{ inputs.test-case-id }}
+        ENV_ID: ${{ inputs.environment-id }}
+        BROWSER_ID: ${{ inputs.browser-id }}
+        ENV_VARS: ${{ inputs.env-vars }}
+        POLL: ${{ inputs.poll-interval }}
+        RUN_TIMEOUT: ${{ inputs.timeout }}
+        FAIL_ON_FAILURE: ${{ inputs.fail-on-test-failure }}
+      run: |
+        # No `set -e`: exit codes are this action's contract, set explicitly.
+        set -uo pipefail
+        echo "::add-mask::$QC_TOKEN"
+        api="${QC_URL%/}"
+
+        for tool in curl jq; do
+          command -v "$tool" >/dev/null 2>&1 || {
+            echo "::error::$tool is required but not installed on this runner"
+            exit 3
+          }
+        done
+
+        # ---- request body --------------------------------------------------
+        # env-vars splits on the FIRST "=" only, so values containing "="
+        # (base64, JWTs) survive intact.
+        body=$(jq -n \
+          --arg group "$GROUP_ID" \
+          --arg case "$CASE_ID" \
+          --arg env "$ENV_ID" \
+          --arg browser "$BROWSER_ID" \
+          --arg envvars "$ENV_VARS" '
+          (
+            if   $group != "" and $case != "" then error("both")
+            elif $group != "" then {test_group_id: $group}
+            elif $case  != "" then {test_case_id: $case}
+            else error("neither")
+            end
+          )
+          + (if $env     != "" then {environment_id: $env}    else {} end)
+          + (if $browser != "" then {browser_id: $browser}    else {} end)
+          + (if $envvars != "" then
+               {environment_variables:
+                 ( $envvars
+                   | split("\n")
+                   | map(select(test("[^[:space:]]")))
+                   | map(split("=") | {key: (.[0] | ltrimstr(" ")), value: (.[1:] | join("="))})
+                   | from_entries )}
+             else {} end)' 2>/dev/null) || {
+          echo "::error::Set exactly one of test-group-id or test-case-id"
+          exit 3
+        }
+
+        # ---- trigger -------------------------------------------------------
+        resp=$(curl -sS -X POST "$api/api/v1/integration/runs" \
+          -H "X-API-Key: $QC_TOKEN" \
+          -H 'Content-Type: application/json' \
+          -d "$body" \
+          -w '\n%{http_code}') || {
+          echo "::error::Could not reach $api — network error or wrong api-url"
+          exit 3
+        }
+        code=$(tail -n1 <<<"$resp")
+        json=$(sed '$d' <<<"$resp")
+
+        if [ "$code" != "202" ]; then
+          detail=$(jq -r '.detail // empty' <<<"$json" 2>/dev/null)
+          echo "::error::Trigger failed (HTTP $code): ${detail:-$json}"
+          exit 3
+        fi
+
+        run_id=$(jq -r '.run_id' <<<"$json")
+        echo "QCentriQ run $run_id triggered for project $PROJECT_ID"
+
+        # ---- poll to a terminal status -------------------------------------
+        deadline=$(( SECONDS + RUN_TIMEOUT ))
+        last=''
+        status='unknown'
+        while :; do
+          if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "::error::Timed out after ${RUN_TIMEOUT}s waiting for run $run_id"
+            exit 3
+          fi
+
+          # A single failed poll must not kill the job — the run is still going.
+          resp=$(curl -sS "$api/api/v1/integration/runs/$run_id" \
+            -H "X-API-Key: $QC_TOKEN" -w '\n%{http_code}') || {
+            sleep "$POLL"; continue
+          }
+          code=$(tail -n1 <<<"$resp")
+          json=$(sed '$d' <<<"$resp")
+          [ "$code" = "200" ] || { sleep "$POLL"; continue; }
+
+          status=$(jq -r '.status // "unknown"' <<<"$json")
+          if [ "$status" != "$last" ]; then
+            echo "Run $run_id: $status"
+            last="$status"
+          fi
+
+          case "$status" in
+            passed|failed|error) break ;;
+          esac
+          sleep "$POLL"
+        done
+
+        # ---- outputs -------------------------------------------------------
+        total=$(jq -r '.summary.total  // 0' <<<"$json")
+        passed=$(jq -r '.summary.passed // 0' <<<"$json")
+        failed=$(jq -r '.summary.failed // 0' <<<"$json")
+
+        {
+          echo "run-id=$run_id"
+          echo "status=$status"
+          echo "total=$total"
+          echo "passed=$passed"
+          echo "failed=$failed"
+        } >> "$GITHUB_OUTPUT"
+
+        # ---- run.log artifact ----------------------------------------------
+        {
+          echo "=== QCentriQ run $run_id — $status ==="
+          echo
+          jq -r '.logs[]?
+            | "Test:   \(.test_case_title // "Unknown")\nStatus: \(.status // "unknown")"
+              + (if .error_message then "\nError:  \(.error_message)" else "" end)
+              + (if .logs then "\nLogs:\n\(.logs)" else "" end)
+              + "\n---"' <<<"$json"
+        } > run.log
+
+        # ---- one inline annotation per failed case --------------------------
+        # GitHub workflow commands need escaping, and "%" must go first or the
+        # escapes it introduces get re-escaped. Property values (title) need
+        # ":" and "," escaped too, since those are structural in the command.
+        jq -r 'def esc:      gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A");
+               def escprop:  esc | gsub(":"; "%3A") | gsub(","; "%2C");
+          .logs[]?
+          | select(.status == "failed")
+          | "::error title=\((.test_case_title // "Test") | escprop)::\((.error_message // "Test failed") | esc)"' <<<"$json"
+
+        # ---- job summary ----------------------------------------------------
+        case "$status" in
+          passed) icon='✅' ;;
+          failed) icon='❌' ;;
+          *)      icon='⚠️' ;;
+        esac
+        {
+          echo "## $icon QCentriQ run \`$run_id\` — $status"
+          echo
+          echo '| Total | Passed | Failed |'
+          echo '|------:|-------:|-------:|'
+          echo "| $total | $passed | $failed |"
+          if [ "$failed" != "0" ]; then
+            echo
+            echo '<details><summary>Failed tests</summary>'
+            echo
+            jq -r '.logs[]? | select(.status == "failed")
+              | "- **\(.test_case_title // "Test")** — \((.error_message // "no message") | gsub("\n"; " "))"' <<<"$json"
+            echo
+            echo '</details>'
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+        # ---- exit code is the gate ------------------------------------------
+        case "$status" in
+          passed) exit 0 ;;
+          failed) [ "$FAIL_ON_FAILURE" = 'true' ] && exit 1 || exit 0 ;;
+          *)      echo "::error::Run $run_id ended with status '$status'"; exit 2 ;;
+        esac
+
+    - name: Upload run log
+      if: always() && inputs.upload-log == 'true' && hashFiles('run.log') != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: qcentriq-run-log-${{ steps.run.outputs.run-id }}
+        path: run.log
+        retention-days: 30
+
+    - name: Comment on pull request
+      if: always() && inputs.comment-on-pr == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        STATUS: ${{ steps.run.outputs.status }}
+        TOTAL: ${{ steps.run.outputs.total }}
+        PASSED: ${{ steps.run.outputs.passed }}
+        FAILED: ${{ steps.run.outputs.failed }}
+        RUN_ID: ${{ steps.run.outputs.run-id }}
+      run: |
+        set -uo pipefail
+        [ -n "${STATUS:-}" ] || exit 0   # run step failed before reporting
+
+        case "$STATUS" in
+          passed) icon='✅' ;;
+          failed) icon='❌' ;;
+          *)      icon='⚠️' ;;
+        esac
+        body="$icon **QCentriQ** — \`$STATUS\`
+        ${PASSED:-0}/${TOTAL:-0} passed, ${FAILED:-0} failed · run \`${RUN_ID:-unknown}\`"
+
+        # Sticky: edit the previous comment instead of stacking one per push.
+        gh pr comment "$PR_NUMBER" --edit-last --body "$body" 2>/dev/null \
+          || gh pr comment "$PR_NUMBER" --body "$body" \
+          || echo "::warning::Could not post PR comment (needs pull-requests: write)"
