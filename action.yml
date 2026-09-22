@@ -110,8 +110,12 @@ runs:
         RUN_TIMEOUT: ${{ inputs.timeout }}
         FAIL_ON_FAILURE: ${{ inputs.fail-on-test-failure }}
       run: |
-        # No `set -e`: exit codes are this action's contract, set explicitly.
+        # GitHub invokes `shell: bash` with -e already on. Clear it: this
+        # action's exit codes are its contract and must be set deliberately,
+        # not inherited from whichever command happened to fail first.
+        set +e
         set -uo pipefail
+
         echo "::add-mask::$QC_TOKEN"
         api="${QC_URL%/}"
 
@@ -122,6 +126,20 @@ runs:
           }
         done
 
+        # Validate the target here rather than inside jq: a jq runtime error
+        # exits 5, which would surface as an opaque failure instead of this
+        # message.
+        if [ -n "$GROUP_ID" ] && [ -n "$CASE_ID" ]; then
+          echo "::error::Set only one of test-group-id or test-case-id, not both"
+          exit 3
+        fi
+        if [ -z "$GROUP_ID" ] && [ -z "$CASE_ID" ]; then
+          echo "::error::Set either test-group-id or test-case-id"
+          exit 3
+        fi
+
+        echo "QCentriQ: api=$api project=$PROJECT_ID target=${GROUP_ID:-$CASE_ID} ($(jq --version))"
+
         # ---- request body --------------------------------------------------
         # env-vars splits on the FIRST "=" only, so values containing "="
         # (base64, JWTs) survive intact.
@@ -131,26 +149,22 @@ runs:
           --arg env "$ENV_ID" \
           --arg browser "$BROWSER_ID" \
           --arg envvars "$ENV_VARS" '
-          (
-            if   $group != "" and $case != "" then error("both")
-            elif $group != "" then {test_group_id: $group}
-            elif $case  != "" then {test_case_id: $case}
-            else error("neither")
-            end
-          )
+          (if $group != "" then {test_group_id: $group} else {test_case_id: $case} end)
           + (if $env     != "" then {environment_id: $env}    else {} end)
           + (if $browser != "" then {browser_id: $browser}    else {} end)
           + (if $envvars != "" then
                {environment_variables:
                  ( $envvars
                    | split("\n")
-                   | map(select(test("[^[:space:]]")))
-                   | map(split("=") | {key: (.[0] | ltrimstr(" ")), value: (.[1:] | join("="))})
+                   | map(select(length > 0 and (test("^[[:space:]]*$") | not)))
+                   | map(split("=") | {key: (.[0] | gsub("^[[:space:]]+|[[:space:]]+$"; "")),
+                                       value: (.[1:] | join("="))})
                    | from_entries )}
-             else {} end)' 2>/dev/null) || {
-          echo "::error::Set exactly one of test-group-id or test-case-id"
+             else {} end)')
+        if [ $? -ne 0 ] || [ -z "$body" ]; then
+          echo "::error::Could not build the request body — check the env-vars input format (KEY=VALUE, one per line)"
           exit 3
-        }
+        fi
 
         # ---- trigger -------------------------------------------------------
         resp=$(curl -sS -X POST "$api/api/v1/integration/runs" \
@@ -170,7 +184,11 @@ runs:
           exit 3
         fi
 
-        run_id=$(jq -r '.run_id' <<<"$json")
+        run_id=$(jq -r '.run_id // empty' <<<"$json" 2>/dev/null)
+        if [ -z "$run_id" ]; then
+          echo "::error::Trigger returned HTTP $code but no run_id. Response: $json"
+          exit 3
+        fi
         echo "QCentriQ run $run_id triggered for project $PROJECT_ID"
 
         # ---- poll to a terminal status -------------------------------------
