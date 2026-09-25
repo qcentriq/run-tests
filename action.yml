@@ -11,7 +11,7 @@
 #
 # Exit codes: 0 passed · 1 test failure · 2 run error · 3 action/transport error
 # =============================================================================
-name: 'QCentriQ Test Run'
+name: 'QCentriQ'
 description: 'Trigger a QCentriQ test suite, report results, and gate the pull request'
 author: 'QCentriQ'
 branding:
