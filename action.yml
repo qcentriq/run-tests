@@ -89,6 +89,9 @@ outputs:
   failed:
     description: 'Number of test cases that failed'
     value: ${{ steps.run.outputs.failed }}
+  target-name:
+    description: 'Title of the test group or test case that was run, when resolvable'
+    value: ${{ steps.run.outputs.target-name }}
 
 runs:
   using: composite
@@ -190,7 +193,29 @@ runs:
           echo "::error::Trigger returned HTTP $code but no run_id. Response: $json"
           exit 3
         fi
-        echo "QCentriQ run $run_id triggered for project $PROJECT_ID"
+        # Resolve a human name for what we are running. The run API returns
+        # only ids, so ask the discovery endpoint once. Entirely optional —
+        # any failure just leaves the name blank.
+        target_name=''
+        info=$(curl -sS -m 30 "$api/api/v1/integration/info" \
+                 -H "X-API-Key: $QC_TOKEN" 2>/dev/null) || info=''
+        if [ -n "$info" ]; then
+          if [ -n "$GROUP_ID" ]; then
+            target_name=$(jq -r --arg id "$GROUP_ID" \
+              '.test_groups[]? | select(.id == $id) | .title // empty' \
+              <<<"$info" 2>/dev/null | head -1)
+          else
+            target_name=$(jq -r --arg id "$CASE_ID" \
+              '.test_groups[]?.test_cases[]? | select(.id == $id) | .title // empty' \
+              <<<"$info" 2>/dev/null | head -1)
+          fi
+        fi
+
+        if [ -n "$target_name" ]; then
+          echo "QCentriQ: running \"$target_name\" (run $run_id)"
+        else
+          echo "QCentriQ run $run_id triggered for project $PROJECT_ID"
+        fi
 
         # ---- poll to a terminal status -------------------------------------
         deadline=$(( SECONDS + RUN_TIMEOUT ))
@@ -234,6 +259,7 @@ runs:
           echo "total=$total"
           echo "passed=$passed"
           echo "failed=$failed"
+          echo "target-name=$target_name"
         } >> "$GITHUB_OUTPUT"
 
         # ---- clean the captured output --------------------------------------
@@ -296,11 +322,19 @@ runs:
         # Lead with what a person needs to know: how many failed, and which
         # ones. The run id is bookkeeping, so it goes in the footer.
         plural=''; [ "$total" = "1" ] || plural='s'
-        case "$status" in
-          passed) heading="✅ All $total test$plural passed" ;;
-          failed) heading="❌ $failed of $total test$plural failed" ;;
-          *)      heading="⚠️ Run did not complete — $status" ;;
-        esac
+        if [ -n "$target_name" ]; then
+          case "$status" in
+            passed) heading="✅ $target_name — all $total test$plural passed" ;;
+            failed) heading="❌ $target_name — $failed of $total test$plural failed" ;;
+            *)      heading="⚠️ $target_name — run did not complete ($status)" ;;
+          esac
+        else
+          case "$status" in
+            passed) heading="✅ All $total test$plural passed" ;;
+            failed) heading="❌ $failed of $total test$plural failed" ;;
+            *)      heading="⚠️ Run did not complete — $status" ;;
+          esac
+        fi
 
         fence='```'
         MAX_LINES=60
@@ -373,6 +407,7 @@ runs:
         PASSED: ${{ steps.run.outputs.passed }}
         FAILED: ${{ steps.run.outputs.failed }}
         RUN_ID: ${{ steps.run.outputs.run-id }}
+        TARGET_NAME: ${{ steps.run.outputs.target-name }}
       run: |
         set -uo pipefail
         [ -n "${STATUS:-}" ] || exit 0   # run step failed before reporting
@@ -382,8 +417,9 @@ runs:
           failed) icon='❌' ;;
           *)      icon='⚠️' ;;
         esac
-        body="$icon **QCentriQ** — \`$STATUS\`
-        ${PASSED:-0}/${TOTAL:-0} passed, ${FAILED:-0} failed · run \`${RUN_ID:-unknown}\`"
+        label="QCentriQ"
+        [ -n "${TARGET_NAME:-}" ] && label="QCentriQ · $TARGET_NAME"
+        body="$icon **$label** — ${PASSED:-0}/${TOTAL:-0} passed, ${FAILED:-0} failed"
 
         # Sticky: edit the previous comment instead of stacking one per push.
         gh pr comment "$PR_NUMBER" --edit-last --body "$body" 2>/dev/null \
