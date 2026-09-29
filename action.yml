@@ -28,6 +28,13 @@ inputs:
   project-id:
     description: 'UUID of the QCentriQ project'
     required: true
+  app-url:
+    description: |
+      Base URL of the QCentriQ web app, e.g. https://app.qcentriq.com. When
+      set, the summary, PR comment and log link straight to the run in the
+      app. Often a different host from api-url.
+    required: false
+    default: ''
   test-group-id:
     description: 'UUID of the test group to run. Mutually exclusive with test-case-id.'
     required: false
@@ -92,6 +99,9 @@ outputs:
   target-name:
     description: 'Title of the test group or test case that was run, when resolvable'
     value: ${{ steps.run.outputs.target-name }}
+  run-url:
+    description: 'Link to the run in the QCentriQ web app (empty unless app-url is set)'
+    value: ${{ steps.run.outputs.run-url }}
 
 runs:
   using: composite
@@ -104,6 +114,7 @@ runs:
         # through `ps` on a shared runner.
         QC_TOKEN: ${{ inputs.api-token }}
         QC_URL: ${{ inputs.api-url }}
+        APP_URL: ${{ inputs.app-url }}
         PROJECT_ID: ${{ inputs.project-id }}
         GROUP_ID: ${{ inputs.test-group-id }}
         CASE_ID: ${{ inputs.test-case-id }}
@@ -211,6 +222,15 @@ runs:
           fi
         fi
 
+        # Link to the run in the web app. Group runs open on the group-detail
+        # page, single-case runs on the plain run page — the same choice the
+        # app's own run list makes.
+        run_url=''
+        if [ -n "$APP_URL" ]; then
+          run_url="${APP_URL%/}/projects/$PROJECT_ID/test-runs/$run_id"
+          [ -n "$GROUP_ID" ] && run_url="$run_url/group-detail"
+        fi
+
         if [ -n "$target_name" ]; then
           echo "QCentriQ: running \"$target_name\" (run $run_id)"
         else
@@ -260,6 +280,7 @@ runs:
           echo "passed=$passed"
           echo "failed=$failed"
           echo "target-name=$target_name"
+          echo "run-url=$run_url"
         } >> "$GITHUB_OUTPUT"
 
         # Print the results in the log too, so nobody needs an extra step to
@@ -272,6 +293,7 @@ runs:
         echo "passed : $passed"
         echo "failed : $failed"
         echo "run-id : $run_id"
+        [ -n "$run_url" ] && echo "view   : $run_url"
         echo "──────────────────────────"
 
         # ---- clean the captured output --------------------------------------
@@ -353,6 +375,10 @@ runs:
         {
           echo "## $heading"
           echo
+          if [ -n "$run_url" ]; then
+            echo "[**View this run in QCentriQ →**]($run_url)"
+            echo
+          fi
           if [ "$total" != "0" ]; then
             echo '| | Test case |'
             echo '|:-:|---|'
@@ -420,6 +446,7 @@ runs:
         FAILED: ${{ steps.run.outputs.failed }}
         RUN_ID: ${{ steps.run.outputs.run-id }}
         TARGET_NAME: ${{ steps.run.outputs.target-name }}
+        RUN_URL: ${{ steps.run.outputs.run-url }}
       run: |
         set -uo pipefail
         [ -n "${STATUS:-}" ] || exit 0   # run step failed before reporting
@@ -432,6 +459,7 @@ runs:
         label="QCentriQ"
         [ -n "${TARGET_NAME:-}" ] && label="QCentriQ · $TARGET_NAME"
         body="$icon **$label** — ${PASSED:-0}/${TOTAL:-0} passed, ${FAILED:-0} failed"
+        [ -n "${RUN_URL:-}" ] && body="$body · [View run]($RUN_URL)"
 
         # Sticky: edit the previous comment instead of stacking one per push.
         gh pr comment "$PR_NUMBER" --edit-last --body "$body" 2>/dev/null \

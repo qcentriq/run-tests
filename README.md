@@ -82,6 +82,7 @@ rule → Require status checks to pass**, then select your job (e.g.
 | `project-id` | yes | — | Project UUID |
 | `test-group-id` | one of | `''` | Test group to run |
 | `test-case-id` | one of | `''` | Single test case to run |
+| `app-url` | no | `''` | QCentriQ web app URL; when set, results link straight to the run |
 | `environment-id` | no | project default | QCentriQ environment to run against |
 | `browser-id` | no | project default | Browser to run on |
 | `env-vars` | no | `''` | `KEY=VALUE` per line, overriding environment values |
@@ -102,6 +103,8 @@ Supply exactly one of `test-group-id` or `test-case-id`.
 | `total` | Test cases executed |
 | `passed` | Test cases that passed |
 | `failed` | Test cases that failed |
+| `target-name` | Title of the group or case that ran |
+| `run-url` | Link to the run in the web app (empty unless `app-url` is set) |
 
 ```yaml
 - uses: qcentriq/run-tests@v1
