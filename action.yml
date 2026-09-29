@@ -11,7 +11,7 @@
 #
 # Exit codes: 0 passed · 1 test failure · 2 run error · 3 action/transport error
 # =============================================================================
-name: 'QCentriQ'
+name: 'QCentriQ Test Run'
 description: 'Trigger a QCentriQ test suite, report results, and gate the pull request'
 author: 'QCentriQ'
 branding:
@@ -235,26 +235,61 @@ runs:
           echo "failed=$failed"
         } >> "$GITHUB_OUTPUT"
 
-        # ---- run.log artifact ----------------------------------------------
+        # ---- clean the captured output --------------------------------------
+        # Runner output arrives with ANSI colour codes from pytest/structlog.
+        # Rendered raw they show up as "\033[32m[1minfo" noise, so strip escape
+        # sequences and stray CRs before any of it is displayed.
+        strip_ansi() {
+          sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\x1b[()][A-Z0-9]//g' \
+              -e 's/\r$//' -e 's/\x1b//g'
+        }
+
+        # Per-failure detail, newline-separated so later loops can iterate ids.
+        failed_idx=$(jq -r '[.logs[]? | select(.status == "failed")] | to_entries[] | .key' <<<"$json")
+
+        detail_for() {   # $1 = index into the failed list
+          jq -r --argjson i "$1" \
+            '[.logs[]? | select(.status == "failed")][$i]
+             | (.error_message // .logs // "No message recorded")' <<<"$json" | strip_ansi
+        }
+        title_for() {
+          jq -r --argjson i "$1" \
+            '[.logs[]? | select(.status == "failed")][$i].test_case_title // "Test"' <<<"$json"
+        }
+
+        # ---- run.log artifact -----------------------------------------------
+        # Full, untruncated output — this is the record when the summary is
+        # only showing a tail.
         {
           echo "=== QCentriQ run $run_id — $status ==="
           echo
           jq -r '.logs[]?
             | "Test:   \(.test_case_title // "Unknown")\nStatus: \(.status // "unknown")"
-              + (if .error_message then "\nError:  \(.error_message)" else "" end)
+              + (if .error_message then "\nError:\n\(.error_message)" else "" end)
               + (if .logs then "\nLogs:\n\(.logs)" else "" end)
-              + "\n---"' <<<"$json"
+              + "\n" + ("-" * 72)' <<<"$json" | strip_ansi
         } > run.log
 
         # ---- one inline annotation per failed case --------------------------
-        # GitHub workflow commands need escaping, and "%" must go first or the
-        # escapes it introduces get re-escaped. Property values (title) need
-        # ":" and "," escaped too, since those are structural in the command.
-        jq -r 'def esc:      gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A");
-               def escprop:  esc | gsub(":"; "%3A") | gsub(","; "%2C");
-          .logs[]?
-          | select(.status == "failed")
-          | "::error title=\((.test_case_title // "Test") | escprop)::\((.error_message // "Test failed") | esc)"' <<<"$json"
+        # Annotations are a one-line surface: GitHub truncates them and renders
+        # them in a tooltip, so send the assertion rather than the whole log.
+        # pytest marks assertion detail with a leading "E "; fall back to the
+        # last few meaningful lines when that is absent.
+        for i in $failed_idx; do
+          t=$(title_for "$i")
+          d=$(detail_for "$i")
+
+          short=$(printf '%s\n' "$d" | grep -E '^[[:space:]]*E[[:space:]]' | head -8)
+          [ -n "$short" ] || short=$(printf '%s\n' "$d" | grep -vE '^[[:space:]]*$' | tail -4)
+          [ -n "$short" ] || short="Test failed"
+          short=$(printf '%s' "$short" | head -c 900)
+
+          # "%" first: escaping it later would mangle the escapes themselves.
+          # Property values (title) also need ":" and "," which are structural.
+          esc() { printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN{ORS="%0A"}{print}' | sed 's/%0A$//'; }
+          escprop() { esc "$1" | sed -e 's/:/%3A/g' -e 's/,/%2C/g'; }
+          echo "::error title=$(escprop "$t")::$(esc "$short")"
+        done
 
         # ---- job summary ----------------------------------------------------
         case "$status" in
@@ -262,21 +297,37 @@ runs:
           failed) icon='❌' ;;
           *)      icon='⚠️' ;;
         esac
+        fence='```'
+        MAX_LINES=60
         {
           echo "## $icon QCentriQ run \`$run_id\` — $status"
           echo
           echo '| Total | Passed | Failed |'
           echo '|------:|-------:|-------:|'
           echo "| $total | $passed | $failed |"
-          if [ "$failed" != "0" ]; then
+
+          for i in $failed_idx; do
+            t=$(title_for "$i")
+            d=$(detail_for "$i")
+            n=$(printf '%s\n' "$d" | wc -l)
+
             echo
-            echo '<details><summary>Failed tests</summary>'
+            echo "<details><summary>❌ $t</summary>"
             echo
-            jq -r '.logs[]? | select(.status == "failed")
-              | "- **\(.test_case_title // "Test")** — \((.error_message // "no message") | gsub("\n"; " "))"' <<<"$json"
+            echo "${fence}text"
+            if [ "$n" -gt "$MAX_LINES" ]; then
+              printf '%s\n' "$d" | tail -n "$MAX_LINES"
+            else
+              printf '%s\n' "$d"
+            fi
+            echo "$fence"
+            if [ "$n" -gt "$MAX_LINES" ]; then
+              echo
+              echo "_Showing the last $MAX_LINES of $n lines — full output in the \`run.log\` artifact._"
+            fi
             echo
             echo '</details>'
-          fi
+          done
         } >> "$GITHUB_STEP_SUMMARY"
 
         # ---- exit code is the gate ------------------------------------------
