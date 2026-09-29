@@ -262,6 +262,18 @@ runs:
           echo "target-name=$target_name"
         } >> "$GITHUB_OUTPUT"
 
+        # Print the results in the log too, so nobody needs an extra step to
+        # see them.
+        echo
+        echo "──── QCentriQ results ────"
+        [ -n "$target_name" ] && echo "target : $target_name"
+        echo "status : $status"
+        echo "total  : $total"
+        echo "passed : $passed"
+        echo "failed : $failed"
+        echo "run-id : $run_id"
+        echo "──────────────────────────"
+
         # ---- clean the captured output --------------------------------------
         # Runner output arrives with ANSI colour codes from pytest/structlog.
         # Rendered raw they show up as "\033[32m[1minfo" noise, so strip escape
