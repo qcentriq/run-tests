@@ -93,7 +93,8 @@ outputs:
 runs:
   using: composite
   steps:
-    - id: run
+    - name: Run QCentriQ suite
+      id: run
       shell: bash
       env:
         # Secrets travel by environment, never argv: argv is world-readable
@@ -292,19 +293,32 @@ runs:
         done
 
         # ---- job summary ----------------------------------------------------
+        # Lead with what a person needs to know: how many failed, and which
+        # ones. The run id is bookkeeping, so it goes in the footer.
+        plural=''; [ "$total" = "1" ] || plural='s'
         case "$status" in
-          passed) icon='✅' ;;
-          failed) icon='❌' ;;
-          *)      icon='⚠️' ;;
+          passed) heading="✅ All $total test$plural passed" ;;
+          failed) heading="❌ $failed of $total test$plural failed" ;;
+          *)      heading="⚠️ Run did not complete — $status" ;;
         esac
+
         fence='```'
         MAX_LINES=60
         {
-          echo "## $icon QCentriQ run \`$run_id\` — $status"
+          echo "## $heading"
           echo
-          echo '| Total | Passed | Failed |'
-          echo '|------:|-------:|-------:|'
-          echo "| $total | $passed | $failed |"
+          if [ "$total" != "0" ]; then
+            echo '| | Test case |'
+            echo '|:-:|---|'
+            # Failures first, so they are visible without scrolling. A "|" in a
+            # title would break the table, so send it as an HTML entity.
+            jq -r '(.logs[]? | select(.status == "failed")),
+                   (.logs[]? | select(.status != "failed"))
+                   | "| \(if .status == "passed" then "✅"
+                          elif .status == "failed" then "❌"
+                          else "⚠️" end) | \((.test_case_title // "Unnamed test")
+                          | gsub("\\|"; "&#124;")) |"' <<<"$json"
+          fi
 
           for i in $failed_idx; do
             t=$(title_for "$i")
@@ -328,6 +342,9 @@ runs:
             echo
             echo '</details>'
           done
+
+          echo
+          echo "<sub>QCentriQ run \`$run_id\`</sub>"
         } >> "$GITHUB_STEP_SUMMARY"
 
         # ---- exit code is the gate ------------------------------------------
