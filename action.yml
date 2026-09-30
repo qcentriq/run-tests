@@ -56,7 +56,9 @@ inputs:
       KEY=VALUE pairs, one per line, overriding the QCentriQ-configured
       environment values. CI wins on collision. The value may itself contain
       "=" (base64, JWTs) — only the first "=" separates key from value.
-      Server limits: at most 50 keys and 4096 bytes serialized.
+      Entries with an empty value are skipped with a warning, so they cannot
+      wipe out a configured value. Server limits: at most 50 keys and 4096
+      bytes serialized.
     required: false
     default: ''
   poll-interval:
@@ -158,24 +160,41 @@ runs:
         # ---- request body --------------------------------------------------
         # env-vars splits on the FIRST "=" only, so values containing "="
         # (base64, JWTs) survive intact.
+        #
+        # Entries whose value is empty are dropped, with a warning. CI values
+        # replace the QCentriQ-configured ones, so "BASE_URL=" would wipe out
+        # the project's URL. That is almost never intended: it is what an
+        # expression becomes when it only resolves on another event, e.g.
+        # deployment_status.target_url in a pull_request workflow.
+        parse_env_vars='
+          split("\n")
+          | map(select(length > 0 and (test("^[[:space:]]*$") | not)))
+          | map(split("=") | {key: (.[0] | gsub("^[[:space:]]+|[[:space:]]+$"; "")),
+                              value: (.[1:] | join("="))})'
+
+        if [ -n "$ENV_VARS" ]; then
+          empty_keys=$(jq -rn --arg v "$ENV_VARS" \
+            "\$v | $parse_env_vars | map(select(.value | test(\"^[[:space:]]*\$\")) | .key) | join(\", \")")
+          if [ -n "$empty_keys" ]; then
+            echo "::warning title=env-vars ignored::Skipping env-vars with an empty value: $empty_keys. An empty value would replace the QCentriQ-configured one, so the configured value is kept. Usually this means the expression only resolves on a different event — e.g. deployment_status.target_url in a pull_request workflow."
+          fi
+        fi
+
         body=$(jq -n \
           --arg group "$GROUP_ID" \
           --arg case "$CASE_ID" \
           --arg env "$ENV_ID" \
           --arg browser "$BROWSER_ID" \
-          --arg envvars "$ENV_VARS" '
-          (if $group != "" then {test_group_id: $group} else {test_case_id: $case} end)
-          + (if $env     != "" then {environment_id: $env}    else {} end)
-          + (if $browser != "" then {browser_id: $browser}    else {} end)
-          + (if $envvars != "" then
-               {environment_variables:
-                 ( $envvars
-                   | split("\n")
-                   | map(select(length > 0 and (test("^[[:space:]]*$") | not)))
-                   | map(split("=") | {key: (.[0] | gsub("^[[:space:]]+|[[:space:]]+$"; "")),
-                                       value: (.[1:] | join("="))})
-                   | from_entries )}
-             else {} end)')
+          --arg envvars "$ENV_VARS" "
+          (if \$group != \"\" then {test_group_id: \$group} else {test_case_id: \$case} end)
+          + (if \$env     != \"\" then {environment_id: \$env}    else {} end)
+          + (if \$browser != \"\" then {browser_id: \$browser}    else {} end)
+          + ( if \$envvars == \"\" then {}
+              else ( \$envvars | $parse_env_vars
+                     | map(select(.value | test(\"^[[:space:]]*\$\") | not))
+                     | from_entries ) as \$ev
+                   | if (\$ev | length) > 0 then {environment_variables: \$ev} else {} end
+              end )")
         if [ $? -ne 0 ] || [ -z "$body" ]; then
           echo "::error::Could not build the request body — check the env-vars input format (KEY=VALUE, one per line)"
           exit 3
@@ -226,7 +245,7 @@ runs:
         # page, single-case runs on the plain run page — the same choice the
         # app's own run list makes.
         run_url=''
-        if [ -n "$APP_URL" ]; then
+        if [ -n "${APP_URL:-}" ]; then
           run_url="${APP_URL%/}/projects/$PROJECT_ID/test-runs/$run_id"
           [ -n "$GROUP_ID" ] && run_url="$run_url/group-detail"
         fi

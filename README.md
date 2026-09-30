@@ -139,6 +139,10 @@ with:
   containing `=` survive intact.
 - CI values win over the QCentriQ-configured environment on collision. The
   selected environment still supplies the browser, secrets and base config.
+- An entry with an **empty value** (`BASE_URL=`) is skipped, with a warning,
+  so it can't wipe out the configured value. This usually means an expression
+  that only resolves on another event — e.g. `deployment_status.target_url`
+  in a `pull_request` workflow.
 - Server limits: at most **50 keys** and **4096 bytes** serialized.
 
 ### Testing a deployment's URL
