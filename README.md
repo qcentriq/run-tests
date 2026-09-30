@@ -61,6 +61,7 @@ you can pick a `test_groups[].id` for `test-group-id` or a
 | `QC_API_URL` | Variable | your QCentriQ base URL |
 | `QC_PROJECT_ID` | Variable | project UUID |
 | `QC_TEST_GROUP_ID` | Variable | test group UUID |
+| `QC_APP_URL` | Variable | optional — the QCentriQ **web app** URL; adds links from the results to the run |
 
 The token must be a **secret**, not a variable — secrets are encrypted and
 masked in logs.
@@ -165,11 +166,22 @@ jobs:
 
 ## What you get in the PR
 
-- **Annotations** — one inline error per failed test case, with its message.
-- **Job summary** — a pass/fail table plus a collapsible list of failures.
-- **A sticky comment** — updated in place on each push rather than stacking.
-  Requires `permissions: pull-requests: write`.
-- **`run.log`** — full per-case logs, uploaded as an artifact even on failure.
+- **In the job log** — the progress of the run, then a results block with the
+  target, status, counts, run id and (with `app-url`) a link to the run. No
+  extra step needed.
+- **Job summary** — a headline naming the group or case and the outcome
+  (*"Admin Login Suite — 1 of 5 tests failed"*), a list of every test case with
+  a pass/fail mark (failures first), and each failure's output in its own
+  collapsible section, with indentation preserved. Long output shows the last
+  60 lines; the full text is in `run.log`.
+- **Annotations** — one per failed test case, carrying just the assertion
+  (pytest's `E ` lines), not the whole log.
+- **A sticky comment** — *"QCentriQ · Admin Login Suite — 4/5 passed, 1
+  failed"*, updated in place on each push rather than stacking. Links to the
+  run when `app-url` is set. Requires `permissions: pull-requests: write`; the
+  action warns rather than failing if it is missing.
+- **`run.log`** — full per-case logs with colour codes stripped, uploaded as an
+  artifact even when the job fails.
 
 ## Troubleshooting
 
